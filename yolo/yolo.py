@@ -4,13 +4,16 @@ import clip
 import numpy as np
 from torchvision.transforms import ToPILImage
 from ultralytics import YOLO
+from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import matplotlib.cm as cm
 
 # === CONFIG ===
 FRAME_SKIP = 5
-RESIZE_WIDTH = 512  # Set to None to disable resizing
+RESIZE_WIDTH = 512
 YOLO_MODEL = "yolov5s.pt"
+N_CLUSTERS = 5
 
 # === LOAD MODELS ===
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -44,12 +47,14 @@ def detect_boxes(frame):
 
 def crop_objects(frame, boxes):
     crops = []
+    coords = []
     for box in boxes:
         x1, y1, x2, y2 = map(int, box[:4])
         crop = frame[y1:y2, x1:x2]
         if crop.size > 0:
             crops.append(crop)
-    return crops
+            coords.append((x1, y1, x2, y2))
+    return crops, coords
 
 def get_clip_embeddings(crops):
     embeddings = []
@@ -64,25 +69,53 @@ def get_clip_embeddings(crops):
             continue
     return embeddings
 
+def color_by_cluster(cluster_id):
+    cmap = cm.get_cmap("tab10")
+    color = cmap(cluster_id % 10)[:3]  # RGB
+    return tuple(int(c * 255) for c in color[::-1])  # BGR for OpenCV
+
 def process_video_for_embeddings(video_path):
     frames = extract_frames(video_path, FRAME_SKIP)
     all_embeddings = []
+    all_coords = []
+    frame_refs = []
     os.makedirs("highlighted_frames", exist_ok=True)
+
     for i, frame in enumerate(frames):
         frame_idx = i * FRAME_SKIP
         boxes = detect_boxes(frame)
-        crops = crop_objects(frame, boxes)
+        crops, coords = crop_objects(frame, boxes)
         embeddings = get_clip_embeddings(crops)
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box[:4])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        out_path = f"highlighted_frames/{os.path.splitext(os.path.basename(video_path))[0]}_frame{frame_idx}.jpg"
-        cv2.imwrite(out_path, frame)
+
         all_embeddings.extend(embeddings)
+        all_coords.extend(coords)
+        frame_refs.extend([(frame_idx, frame.copy()) for _ in coords])
+
+    if not all_embeddings:
+        return np.array([])
+
+    km = KMeans(n_clusters=min(N_CLUSTERS, len(all_embeddings)), random_state=0).fit(all_embeddings)
+    labels = km.labels_
+
+    # draw
+    frames_colored = {}
+    for (frame_idx, base_frame), (x1, y1, x2, y2), cluster in zip(frame_refs, all_coords, labels):
+        color = color_by_cluster(cluster)
+        if frame_idx not in frames_colored:
+            frames_colored[frame_idx] = base_frame.copy()
+        cv2.rectangle(frames_colored[frame_idx], (x1, y1), (x2, y2), color, 2)
+
+    for idx, img in frames_colored.items():
+        out_path = f"highlighted_frames/{os.path.splitext(os.path.basename(video_path))[0]}_frame{idx}.jpg"
+        cv2.imwrite(out_path, img)
+
     return np.array(all_embeddings)
+
+import time
 
 # === MAIN ===
 if __name__ == "__main__":
+    total_start = time.time()
     video_path1 = "kangur1.mp4"
     video_path2 = "kangur2.mp4"
     emb1 = process_video_for_embeddings(video_path1)
@@ -93,4 +126,5 @@ if __name__ == "__main__":
     else:
         sim_matrix = cosine_similarity(emb1, emb2)
         mean_sim = np.mean(sim_matrix)
-        print(f"\nSimilarity between videos: {mean_sim:.4f}")
+        print(f"Similarity between videos: {mean_sim:.4f}")
+        print(f"Total analysis time: {time.time() - total_start:.2f} seconds")
